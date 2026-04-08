@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "单纯的漏洞扫描工具",
+  "outputfilename": "swallow-vuln-scanner",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "YZZ-BBD",
+    "email": "yanzhou001@chinasoftinc.com"
+  },
+  "icons": {
+    "favicon": "build/123.png",
+    "windows": {
+      "ico": "build/windows/icon.ico"
+    }
+  }
+}

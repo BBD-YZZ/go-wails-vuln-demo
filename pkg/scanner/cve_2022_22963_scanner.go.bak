@@ -1,0 +1,332 @@
+package vulns
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+	"vuln-scanner/client"
+	"vuln-scanner/common"
+	"vuln-scanner/logger"
+)
+
+// CVE202222963Scanner CVE-2022-22963漏洞扫描器
+// 实现Spring Cloud Function SpEL表达式注入漏洞扫描
+type CVE202222963Scanner struct {
+	statistics ScanStatistics // 扫描统计信息
+	startTime  time.Time      // 扫描开始时间
+}
+
+// NewCVE202222963Scanner 创建CVE-2022-22963漏洞扫描器
+func NewCVE202222963Scanner() *CVE202222963Scanner {
+	return &CVE202222963Scanner{}
+}
+
+// GetScannerName 获取扫描器名称
+func (s *CVE202222963Scanner) GetScannerName() string {
+	return "cve_2022_22963_scanner"
+}
+
+// GetSupportedVulnerabilities 获取扫描器支持的漏洞类型
+func (s *CVE202222963Scanner) GetSupportedVulnerabilities() []string {
+	return []string{
+		"CVE-2022-22963",
+	}
+}
+
+// GetScanStatistics 获取扫描统计信息
+func (s *CVE202222963Scanner) GetScanStatistics() ScanStatistics {
+	// 确保更新扫描持续时间
+	if s.statistics.ScanDuration == 0 && !s.startTime.IsZero() {
+		s.statistics.ScanDuration = time.Since(s.startTime)
+	}
+	return s.statistics
+}
+
+// Scan 执行CVE-2022-22963漏洞扫描
+func (s *CVE202222963Scanner) Scan(ctx context.Context, target string, options ScanOptions) ([]common.Vulnerability, error) {
+	var vulnerabilities []common.Vulnerability
+
+	// 初始化统计信息
+	s.statistics = ScanStatistics{}
+	s.startTime = time.Now()
+
+	// 获取或创建Logger
+	log := options.Logger
+	if log == nil {
+		log = logger.NewDefaultLogger()
+	}
+
+	// 创建日志上下文
+	baseCtx := logger.LogContext{
+		Target:      target,
+		ScannerName: s.GetScannerName(),
+		Timestamp:   time.Now(),
+	}
+
+	log.Info("开始CVE-2022-22963漏洞扫描", baseCtx)
+	log.LogScanStep("初始化扫描器", map[string]interface{}{
+		"target":      target,
+		"scanner":     s.GetScannerName(),
+		"timeout":     options.Timeout,
+		"proxy":       options.Proxy != "",
+		"randomAgent": options.RandomAgent,
+	}, baseCtx)
+
+	// 检查上下文是否已取消
+	select {
+	case <-ctx.Done():
+		err := &ScanError{
+			Type:    ErrorTypeTimeout,
+			Message: "扫描上下文已取消",
+			Target:  target,
+			Err:     ctx.Err(),
+		}
+		log.Error("扫描被取消", err, baseCtx)
+		return nil, err
+	default:
+	}
+
+	// 创建HTTP客户端
+	clientConfig := client.HTTPClientConfig{
+		Timeout:   time.Duration(options.Timeout) * time.Second,
+		Proxy:     options.Proxy,
+		SkipSSL:   options.SkipSSL,
+		UserAgent: "",
+		Headers:   options.Headers,
+		Cookies:   options.Cookies,
+	}
+	if options.RandomAgent {
+		clientConfig.UserAgent = client.GetRandomUserAgent()
+		log.Debug(fmt.Sprintf("使用随机User-Agent: %s", clientConfig.UserAgent), baseCtx)
+	}
+
+	client, err := client.NewHTTPClient(clientConfig)
+	if err != nil {
+		log.Error("创建HTTP客户端失败", err, baseCtx)
+		return nil, &ScanError{
+			Type:    ErrorTypeConfig,
+			Message: "创建HTTP客户端失败",
+			Target:  target,
+			Err:     err,
+		}
+	}
+
+	log.LogScanStep("HTTP客户端创建成功", map[string]interface{}{},
+		baseCtx)
+
+	log.LogScanStep("开始CVE-2022-22963扫描", map[string]interface{}{},
+		baseCtx)
+
+	// 定义测试端点
+	endpoints := []string{
+		"/functionRouter",
+		"/actuator/functionRouter",
+	}
+
+	// 定义测试载荷
+	testPayloads := []string{
+		"test=test&functionRouter=toString().class.getClassLoader()",
+		"test=test&functionRouter=toString().class.forName('java.lang.Runtime')",
+		"test=test&functionRouter=T(java.lang.Runtime).getRuntime()",
+	}
+
+	log.Info(fmt.Sprintf("将测试 %d 个端点和 %d 个载荷", len(endpoints), len(testPayloads)), baseCtx)
+
+	// 遍历测试所有端点
+	for _, endpoint := range endpoints {
+		stepCtx := logger.LogContext{
+			Target:      target + endpoint,
+			ScannerName: s.GetScannerName(),
+			Timestamp:   time.Now(),
+			Extra:       map[string]interface{}{"endpoint": endpoint},
+		}
+
+		log.Debug(fmt.Sprintf("测试端点: %s", endpoint), stepCtx)
+
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			err := &ScanError{
+				Type:    ErrorTypeTimeout,
+				Message: "扫描上下文已取消",
+				Target:  target,
+				Err:     ctx.Err(),
+			}
+			log.Error("扫描被取消", err, stepCtx)
+			return nil, err
+		default:
+		}
+
+		// 遍历测试所有载荷
+		for _, payload := range testPayloads {
+			payloadCtx := logger.LogContext{
+				Target:      target + endpoint,
+				ScannerName: s.GetScannerName(),
+				Timestamp:   time.Now(),
+				Extra:       map[string]interface{}{"endpoint": endpoint, "payload": payload},
+			}
+
+			// 构造请求URL
+			url := fmt.Sprintf("%s%s", target, endpoint)
+
+			// 构造请求头
+			headers := map[string]string{
+				"Content-Type": "application/x-www-form-urlencoded",
+			}
+
+			// 创建请求
+			req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
+			if err != nil {
+				log.Warn(fmt.Sprintf("创建请求失败: %v", err), payloadCtx)
+				continue
+			}
+
+			// 设置请求头
+			for key, value := range headers {
+				req.Header.Set(key, value)
+			}
+
+			// 记录请求信息
+			log.LogRequest("POST", url, headers, []byte(payload), payloadCtx)
+
+			// 发送请求
+			start := time.Now()
+			resp, err := client.Do(req)
+			duration := time.Since(start)
+			if err != nil {
+				log.Warn(fmt.Sprintf("请求失败: %v", err), payloadCtx)
+				continue
+			}
+			defer resp.Body.Close()
+
+			// 读取响应体
+			respBody := &bytes.Buffer{}
+			if _, err := respBody.ReadFrom(resp.Body); err != nil {
+				log.Warn(fmt.Sprintf("读取响应体失败: %v", err), payloadCtx)
+				continue
+			}
+			responseBody := respBody.String()
+
+			// 获取响应头
+			respHeaders := make(map[string]string)
+			for key, value := range resp.Header {
+				if len(value) > 0 {
+					respHeaders[key] = value[0]
+				}
+			}
+
+			// 记录响应信息
+			log.LogResponse(resp.StatusCode, respHeaders, []byte(responseBody), duration, payloadCtx)
+
+			// 分析响应，判断是否存在漏洞
+			log.Debug(fmt.Sprintf("分析响应，状态码: %d", resp.StatusCode), payloadCtx)
+
+			// 检查响应体中是否包含特定错误信息
+			// 如果响应中包含Java类或方法名，可能表示SpEL表达式被执行了
+			bodyChecks := []string{
+				"java.lang.Class",
+				"java.lang.ClassLoader",
+				"java.lang.Runtime",
+				"java.lang.Process",
+				"Cannot find class",
+				"No such method",
+				"EL1004E:",
+				"SpEL expression",
+			}
+
+			bodyContainsVulnerability := false
+			for _, check := range bodyChecks {
+				if strings.Contains(responseBody, check) {
+					bodyContainsVulnerability = true
+					break
+				}
+			}
+
+			log.Debug(fmt.Sprintf("响应体特征检查: %v", bodyContainsVulnerability), payloadCtx)
+
+			// 检查响应头中是否包含特定信息
+			headerChecks := []string{
+				"java.lang.Class",
+				"java.lang.Runtime",
+			}
+
+			headerContainsVulnerability := false
+			for key, value := range respHeaders {
+				for _, check := range headerChecks {
+					if strings.Contains(key, check) || strings.Contains(value, check) {
+						headerContainsVulnerability = true
+						break
+					}
+				}
+				if headerContainsVulnerability {
+					break
+				}
+			}
+
+			log.Debug(fmt.Sprintf("响应头检查: %v", headerContainsVulnerability), payloadCtx)
+
+			// 如果检测到漏洞特征
+			if bodyContainsVulnerability || headerContainsVulnerability {
+				log.Warn("检测到潜在的漏洞特征，进行详细分析", payloadCtx)
+
+				detectionDetails := map[string]interface{}{
+					"endpoint":             endpoint,
+					"payload":              payload,
+					"status_code":          resp.StatusCode,
+					"body_checks_passed":   bodyContainsVulnerability,
+					"header_checks_passed": headerContainsVulnerability,
+				}
+
+				log.LogScanStep("漏洞确认", detectionDetails, payloadCtx)
+
+				// 构造漏洞信息
+				vulnerability := common.Vulnerability{
+					ID:                1,
+					VulnerabilityType: "CVE-2022-22963",
+					Severity:          "高危",
+					Target:            target,
+					URL:               url,
+					Payload:           payload,
+					Description:       "Spring Cloud Function SpEL表达式注入漏洞",
+					Proof:             fmt.Sprintf("响应中包含漏洞特征: %v", bodyContainsVulnerability || headerContainsVulnerability),
+					Recommendation:    "升级到安全版本或禁用functionRouter端点",
+					ResponseHeaders:   respHeaders,
+					ResponseContent:   responseBody,
+					Timestamp:         time.Now(),
+				}
+
+				log.LogVulnerabilityFound(vulnerability, payloadCtx)
+				log.Info(fmt.Sprintf("发现漏洞: %s at %s", vulnerability.VulnerabilityType, url), payloadCtx)
+
+				vulnerabilities = append(vulnerabilities, vulnerability)
+				// 更新统计信息
+				s.statistics.VulnerabilitiesFound++
+			} else {
+				log.Debug("未发现漏洞特征，继续测试下一个载荷", payloadCtx)
+			}
+
+			// 等待指定的延迟时间
+			if options.Delay > 0 {
+				log.Debug(fmt.Sprintf("等待 %v 后继续", options.Delay), payloadCtx)
+				time.Sleep(options.Delay)
+			}
+		}
+	}
+
+	// 等待指定的延迟时间
+	if options.Delay > 0 {
+		log.Debug(fmt.Sprintf("等待 %v 后继续", options.Delay), baseCtx)
+		time.Sleep(options.Delay)
+	}
+
+	// 更新统计信息
+	s.statistics.ScanDuration = time.Since(s.startTime)
+
+	log.Info(fmt.Sprintf("扫描完成，共发现 %d 个漏洞", len(vulnerabilities)), baseCtx)
+	log.Info(fmt.Sprintf("扫描统计: %+v", s.statistics), baseCtx)
+
+	return vulnerabilities, nil
+}

